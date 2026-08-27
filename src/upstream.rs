@@ -107,7 +107,7 @@ pub async fn connect_http_tunnel(
         ));
     }
 
-    let authority = format!("{}:{}", target_host, target_port);
+    let authority = format_target_authority(target_host, target_port);
     info!(
         "Connecting to upstream HTTP proxy {} for {}",
         proxy.proxy_url(),
@@ -279,16 +279,29 @@ pub async fn connect_socks5_tunnel(
         }
     }
 
-    let host_bytes = target_host.as_bytes();
-    if host_bytes.len() > u8::MAX as usize {
-        return Err(DohProxyError::Proxy(
-            "SOCKS5 target host is too long".to_string(),
-        ));
+    let mut request = Vec::with_capacity(22 + target_host.len());
+    request.extend_from_slice(&[0x05, 0x01, 0x00]);
+    match target_host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(address)) => {
+            request.push(0x01);
+            request.extend_from_slice(&address.octets());
+        }
+        Ok(IpAddr::V6(address)) => {
+            request.push(0x04);
+            request.extend_from_slice(&address.octets());
+        }
+        Err(_) => {
+            let host_bytes = target_host.as_bytes();
+            if host_bytes.len() > u8::MAX as usize {
+                return Err(DohProxyError::Proxy(
+                    "SOCKS5 target host is too long".to_string(),
+                ));
+            }
+            request.push(0x03);
+            request.push(host_bytes.len() as u8);
+            request.extend_from_slice(host_bytes);
+        }
     }
-
-    let mut request = Vec::with_capacity(7 + host_bytes.len());
-    request.extend_from_slice(&[0x05, 0x01, 0x00, 0x03, host_bytes.len() as u8]);
-    request.extend_from_slice(host_bytes);
     request.push((target_port >> 8) as u8);
     request.push((target_port & 0xff) as u8);
     stream.write_all(&request).await?;
@@ -368,7 +381,10 @@ pub async fn connect_shadowsocks_tunnel(
     let server_config = ServerConfig::new(server_addr, password.to_string(), cipher)
         .map_err(|error| DohProxyError::Proxy(format!("Invalid Shadowsocks config: {}", error)))?;
     let context = Context::new_shared(ServerType::Local);
-    let target = Address::from((target_host.to_string(), target_port));
+    let target = match target_host.parse::<IpAddr>() {
+        Ok(address) => Address::SocketAddress(SocketAddr::new(address, target_port)),
+        Err(_) => Address::from((target_host.to_string(), target_port)),
+    };
 
     info!(
         "Connecting to upstream Shadowsocks proxy {} for {}:{} with cipher {}",
@@ -397,6 +413,13 @@ fn socks5_reply_message(code: u8) -> &'static str {
         0x07 => "command not supported",
         0x08 => "address type not supported",
         _ => "unknown error",
+    }
+}
+
+fn format_target_authority(target_host: &str, target_port: u16) -> String {
+    match target_host.parse::<IpAddr>() {
+        Ok(IpAddr::V6(_)) => format!("[{}]:{}", target_host, target_port),
+        _ => format!("{}:{}", target_host, target_port),
     }
 }
 

@@ -57,13 +57,14 @@ impl DohProxyServer {
             info!("Creating local proxy in pure upstream tunnel mode");
         }
 
-        let dns_resolver = if config.enable_doh {
+        let dns_resolver = if config.enable_doh || !config.host_overrides.is_empty() {
             Some(
-                DnsResolver::shared(
+                DnsResolver::shared_with_overrides(
                     &config.doh_server,
                     config.doh_server_ech.as_deref(),
                     config.prefer_ipv6,
                     config.upstream_proxy.clone(),
+                    Some(config.host_overrides.clone()),
                 )
                 .await?,
             )

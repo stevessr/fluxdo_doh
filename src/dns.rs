@@ -63,6 +63,7 @@ pub struct DnsResolver {
     ip_inflight: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     ip_rtt_cache: Arc<RwLock<HashMap<IpAddr, CachedIpRtt>>>,
     preferred_host_ip_cache: Arc<RwLock<HashMap<String, CachedPreferredHostIp>>>,
+    host_overrides: HashMap<String, Vec<IpAddr>>,
     prefer_ipv6: bool,
     resolve_timeout: Duration,
     /// 查询计数器，用于定期清理缓存
@@ -133,21 +134,72 @@ pub struct HttpsHints {
 }
 
 impl DnsResolver {
+    fn normalize_host(domain: &str) -> String {
+        domain.trim().trim_end_matches('.').to_ascii_lowercase()
+    }
+
+    fn normalize_host_overrides(
+        raw: HashMap<String, Vec<String>>,
+        prefer_ipv6: bool,
+    ) -> HashMap<String, Vec<IpAddr>> {
+        let mut normalized = HashMap::new();
+        for (host, values) in raw {
+            let host = Self::normalize_host(&host);
+            if host.is_empty() {
+                continue;
+            }
+
+            let mut addresses = Vec::new();
+            for value in values {
+                let Ok(address) = value.trim().parse::<IpAddr>() else {
+                    continue;
+                };
+                if !addresses.contains(&address) {
+                    addresses.push(address);
+                }
+            }
+            if addresses.is_empty() {
+                continue;
+            }
+
+            if prefer_ipv6 {
+                addresses.sort_by_key(|address| if address.is_ipv6() { 0 } else { 1 });
+            } else {
+                addresses.sort_by_key(|address| if address.is_ipv4() { 0 } else { 1 });
+            }
+            normalized.insert(host, addresses);
+        }
+        normalized
+    }
+
     fn shared_cache_key(
         doh_url: &str,
         doh_url_ech: Option<&str>,
         prefer_ipv6: bool,
         upstream_proxy: Option<&UpstreamProxyConfig>,
+        host_overrides: Option<&HashMap<String, Vec<String>>>,
     ) -> String {
         let upstream_key = upstream_proxy
             .map(UpstreamProxyConfig::cache_key)
             .unwrap_or_default();
+        let hosts_key = host_overrides
+            .map(|overrides| {
+                let mut entries: Vec<_> = overrides.iter().collect();
+                entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+                entries
+                    .into_iter()
+                    .map(|(host, ips)| format!("{}={}", host, ips.join(",")))
+                    .collect::<Vec<_>>()
+                    .join(";")
+            })
+            .unwrap_or_default();
         format!(
-            "{}|{}|{}|{}",
+            "{}|{}|{}|{}|hosts={}",
             doh_url,
             doh_url_ech.unwrap_or(""),
             if prefer_ipv6 { "v6" } else { "v4" },
             upstream_key,
+            hosts_key,
         )
     }
 
@@ -161,12 +213,23 @@ impl DnsResolver {
         prefer_ipv6: bool,
         upstream_proxy: Option<UpstreamProxyConfig>,
     ) -> Result<Arc<Self>> {
+        Self::shared_with_overrides(doh_url, doh_url_ech, prefer_ipv6, upstream_proxy, None).await
+    }
+
+    pub async fn shared_with_overrides(
+        doh_url: &str,
+        doh_url_ech: Option<&str>,
+        prefer_ipv6: bool,
+        upstream_proxy: Option<UpstreamProxyConfig>,
+        host_overrides: Option<HashMap<String, Vec<String>>>,
+    ) -> Result<Arc<Self>> {
         let normalized_doh_url_ech = doh_url_ech.filter(|value| *value != doh_url);
         let cache_key = Self::shared_cache_key(
             doh_url,
             normalized_doh_url_ech,
             prefer_ipv6,
             upstream_proxy.as_ref(),
+            host_overrides.as_ref(),
         );
 
         {
@@ -177,11 +240,12 @@ impl DnsResolver {
         }
 
         let resolver = Arc::new(
-            Self::new(
+            Self::new_with_overrides(
                 doh_url,
                 normalized_doh_url_ech,
                 prefer_ipv6,
                 upstream_proxy.clone(),
+                host_overrides.clone(),
             )
             .await?,
         );
@@ -198,6 +262,13 @@ impl DnsResolver {
         for resolver in guard.values() {
             resolver.clear_all_caches();
         }
+    }
+
+    /// Return addresses pinned by the imported hosts file, if any.
+    pub fn host_override_addrs(&self, domain: &str) -> Option<Vec<IpAddr>> {
+        self.host_overrides
+            .get(&Self::normalize_host(domain))
+            .cloned()
     }
 
     pub async fn shared_cache_stats() -> DnsCacheStats {
@@ -248,8 +319,23 @@ impl DnsResolver {
         prefer_ipv6: bool,
         upstream_proxy: Option<UpstreamProxyConfig>,
     ) -> Result<Self> {
+        Self::new_with_overrides(doh_url, doh_url_ech, prefer_ipv6, upstream_proxy, None).await
+    }
+
+    pub async fn new_with_overrides(
+        doh_url: &str,
+        doh_url_ech: Option<&str>,
+        prefer_ipv6: bool,
+        upstream_proxy: Option<UpstreamProxyConfig>,
+        host_overrides: Option<HashMap<String, Vec<String>>>,
+    ) -> Result<Self> {
         let (config, doh_uri_ip) = Self::parse_doh_url(doh_url, prefer_ipv6).await?;
-        let mut resolver = Self::with_resolver_config(config, prefer_ipv6).await?;
+        let mut resolver = Self::with_resolver_config_and_overrides(
+            config,
+            prefer_ipv6,
+            host_overrides.unwrap_or_default(),
+        )
+        .await?;
         if let Some(uri) = doh_uri_ip {
             let client = Self::build_doh_client(resolver.resolve_timeout, upstream_proxy.as_ref())?;
             resolver.doh_uri_ip = Some(uri.clone());
@@ -444,6 +530,14 @@ impl DnsResolver {
 
     /// Create a new DNS resolver with ResolverConfig
     pub async fn with_resolver_config(config: ResolverConfig, prefer_ipv6: bool) -> Result<Self> {
+        Self::with_resolver_config_and_overrides(config, prefer_ipv6, HashMap::new()).await
+    }
+
+    pub async fn with_resolver_config_and_overrides(
+        config: ResolverConfig,
+        prefer_ipv6: bool,
+        host_overrides: HashMap<String, Vec<String>>,
+    ) -> Result<Self> {
         let mut opts = ResolverOpts::default();
         opts.use_hosts_file = false;
         let resolve_timeout = Duration::from_secs(5);
@@ -467,6 +561,7 @@ impl DnsResolver {
             ip_inflight: Arc::new(Mutex::new(HashMap::new())),
             ip_rtt_cache: Arc::new(RwLock::new(HashMap::new())),
             preferred_host_ip_cache: Arc::new(RwLock::new(HashMap::new())),
+            host_overrides: Self::normalize_host_overrides(host_overrides, prefer_ipv6),
             prefer_ipv6,
             resolve_timeout,
             query_count: AtomicU64::new(0),
@@ -667,6 +762,10 @@ impl DnsResolver {
 
     /// Lookup IP addresses for a domain
     pub async fn lookup_ip(&self, domain: &str) -> Result<Vec<IpAddr>> {
+        if let Some(addrs) = self.host_override_addrs(domain) {
+            return Ok(addrs);
+        }
+
         // 定期清理过期缓存
         self.maybe_cleanup_caches();
 

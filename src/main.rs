@@ -78,6 +78,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|i| args.get(i + 1))
         .cloned();
 
+    let host_overrides = if let Some(path) = args
+        .iter()
+        .position(|a| a == "--hosts-file")
+        .and_then(|i| args.get(i + 1))
+    {
+        let content = std::fs::read_to_string(path)?;
+        serde_json::from_str::<std::collections::HashMap<String, Vec<String>>>(&content)?
+    } else {
+        std::collections::HashMap::new()
+    };
+
     let upstream_proxy = match (upstream_host, upstream_port) {
         (Some(host), Some(port)) if !host.trim().is_empty() && port > 0 => {
             Some(UpstreamProxyConfig {
@@ -101,6 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         doh_server_ech,
         upstream_proxy,
         server_ip,
+        host_overrides,
         h2_mitm,
         ..Default::default()
     };
@@ -109,21 +121,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let doh_ech_str = config.doh_server_ech.as_deref().unwrap_or("(same as dns)");
     if let Some(proxy) = config.upstream_proxy.as_ref() {
         info!(
-            "Config: bind_port={}, enable_doh={}, prefer_ipv6={}, doh_server={}, doh_server_ech={}, server_ip={}, upstream={}://{}:{}",
+            "Config: bind_port={}, enable_doh={}, prefer_ipv6={}, doh_server={}, doh_server_ech={}, server_ip={}, hosts={}, upstream={}://{}:{}",
             config.bind_port,
             config.enable_doh,
             config.prefer_ipv6,
             config.doh_server,
             doh_ech_str,
             server_ip_str,
+            config.host_overrides.len(),
             proxy.protocol(),
             proxy.host,
             proxy.port
         );
     } else {
         info!(
-            "Config: bind_port={}, enable_doh={}, prefer_ipv6={}, doh_server={}, doh_server_ech={}, server_ip={}, upstream=disabled",
-            config.bind_port, config.enable_doh, config.prefer_ipv6, config.doh_server, doh_ech_str, server_ip_str
+            "Config: bind_port={}, enable_doh={}, prefer_ipv6={}, doh_server={}, doh_server_ech={}, server_ip={}, hosts={}, upstream=disabled",
+            config.bind_port,
+            config.enable_doh,
+            config.prefer_ipv6,
+            config.doh_server,
+            doh_ech_str,
+            server_ip_str,
+            config.host_overrides.len()
         );
     }
 

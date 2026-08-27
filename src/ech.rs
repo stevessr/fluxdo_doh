@@ -91,6 +91,50 @@ impl DohTlsConnector {
     /// CF 验证域名（challenges.cloudflare.com）以隧道方式直连时走此路径：
     /// 既保证与真 CF 端到端 TLS，又不把域名泄漏给系统 DNS。
     pub async fn connect_tcp(&self, host: &str, port: u16) -> Result<BoxStream> {
+        // Imported hosts mappings take precedence over both the system resolver
+        // and the upstream proxy's own DNS resolution.
+        if let Some(resolver) = self.dns_resolver.as_ref() {
+            if let Some(addrs) = resolver.host_override_addrs(host) {
+                let ordered = resolver.order_addrs_by_rtt(addrs);
+                let mut last_err: Option<DohProxyError> = None;
+                for ip in ordered {
+                    let result = if let Some(proxy) = self
+                        .upstream_proxy
+                        .as_ref()
+                        .filter(|proxy| proxy.is_valid())
+                    {
+                        match tokio::time::timeout(
+                            self.timeout,
+                            connect_tunnel(proxy, &ip.to_string(), port),
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => Err(DohProxyError::Timeout),
+                        }
+                    } else {
+                        self.tcp_connect_addr(SocketAddr::new(ip, port))
+                            .await
+                            .map(|stream| Box::new(stream) as BoxStream)
+                    };
+
+                    match result {
+                        Ok(stream) => return Ok(stream),
+                        Err(error) => {
+                            warn!(
+                                "Hosts override TCP connect to {}:{} via {} failed: {}",
+                                host, port, ip, error
+                            );
+                            last_err = Some(error);
+                        }
+                    }
+                }
+                return Err(last_err.unwrap_or_else(|| {
+                    DohProxyError::Dns(format!("No reachable hosts override IP for {}", host))
+                }));
+            }
+        }
+
         // 有上游代理：交给上游隧道，由上游负责解析
         if let Some(proxy) = self
             .upstream_proxy
@@ -110,32 +154,34 @@ impl DohTlsConnector {
         }
 
         // 优先 DoH 解析（不走系统 DNS），按 RTT 排序后逐个尝试
-        if let Some(resolver) = self.dns_resolver.as_ref() {
-            match resolver.lookup_ip(host).await {
-                Ok(addrs) if !addrs.is_empty() => {
-                    let ordered = resolver.order_addrs_by_rtt(addrs);
-                    let mut last_err: Option<DohProxyError> = None;
-                    for ip in ordered {
-                        match self.tcp_connect_addr(SocketAddr::new(ip, port)).await {
-                            Ok(stream) => return Ok(Box::new(stream)),
-                            Err(e) => {
-                                warn!("Tunnel TCP connect to {} failed: {}", ip, e);
-                                last_err = Some(e);
+        if self.enable_doh {
+            if let Some(resolver) = self.dns_resolver.as_ref() {
+                match resolver.lookup_ip(host).await {
+                    Ok(addrs) if !addrs.is_empty() => {
+                        let ordered = resolver.order_addrs_by_rtt(addrs);
+                        let mut last_err: Option<DohProxyError> = None;
+                        for ip in ordered {
+                            match self.tcp_connect_addr(SocketAddr::new(ip, port)).await {
+                                Ok(stream) => return Ok(Box::new(stream)),
+                                Err(e) => {
+                                    warn!("Tunnel TCP connect to {} failed: {}", ip, e);
+                                    last_err = Some(e);
+                                }
                             }
                         }
+                        return Err(last_err.unwrap_or_else(|| {
+                            DohProxyError::Dns(format!("No reachable IP for {}", host))
+                        }));
                     }
-                    return Err(last_err.unwrap_or_else(|| {
-                        DohProxyError::Dns(format!("No reachable IP for {}", host))
-                    }));
+                    Ok(_) => warn!(
+                        "DoH returned no IP for {}, falling back to system DNS",
+                        host
+                    ),
+                    Err(e) => warn!(
+                        "DoH lookup failed for {} ({}), falling back to system DNS",
+                        host, e
+                    ),
                 }
-                Ok(_) => warn!(
-                    "DoH returned no IP for {}, falling back to system DNS",
-                    host
-                ),
-                Err(e) => warn!(
-                    "DoH lookup failed for {} ({}), falling back to system DNS",
-                    host, e
-                ),
             }
         }
 
@@ -216,7 +262,8 @@ impl DohTlsConnector {
             .ok_or_else(|| DohProxyError::Dns("DoH resolver is not initialized".to_string()))?;
 
         // 1. 并行查询 ECH 配置和 IP 地址
-        let (ech_config, ip_result) = if self.server_ip.is_some() {
+        let has_host_override = dns_resolver.host_override_addrs(host).is_some();
+        let (ech_config, ip_result) = if self.server_ip.is_some() && !has_host_override {
             // server_ip 已指定，只需查 ECH 配置
             let ech_result = match dns_resolver.lookup_ech_config(host).await {
                 Ok(config) => config,

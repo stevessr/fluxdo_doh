@@ -140,6 +140,9 @@ pub struct ProxyConfig {
     /// Optional server IP address to connect directly, skipping DNS resolution
     #[serde(default)]
     pub server_ip: Option<String>,
+    /// Static host-to-IP mappings imported from a system-style hosts file.
+    #[serde(default)]
+    pub host_overrides: std::collections::HashMap<String, Vec<String>>,
     /// Gateway (reverse proxy) mode: accept plain HTTP, forward via TLS+ECH
     /// Eliminates double TLS overhead compared to MITM mode
     #[serde(default)]
@@ -173,6 +176,7 @@ impl Default for ProxyConfig {
             timeout_secs: 30,
             upstream_proxy: None,
             server_ip: None,
+            host_overrides: std::collections::HashMap::new(),
             gateway_mode: false,
             mitm_connect: true,
             h2_mitm: false,
