@@ -117,6 +117,19 @@ pub extern "C" fn doh_proxy_start_with_config_json(config_json: *const c_char) -
     start_server_with_config(config)
 }
 
+/// 更新 rhttp/FFI 查询共用的公共 ECH 策略；清理旧策略的解析器缓存。
+#[no_mangle]
+pub extern "C" fn doh_proxy_set_ech_dns_policy_json(policy_json: *const c_char) -> c_int {
+    let Ok(value) = parse_required_string(policy_json, "ech_dns_policy") else {
+        return -1;
+    };
+    let Ok(policy) = serde_json::from_str(&value) else {
+        return -1;
+    };
+    get_runtime().block_on(crate::dns::DnsResolver::set_shared_ech_dns_policy(policy));
+    0
+}
+
 /// Start the DOH proxy server (legacy API, uses Cloudflare DOH)
 /// Returns the port number on success, or -1 on failure
 #[no_mangle]

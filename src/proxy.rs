@@ -59,11 +59,12 @@ impl DohProxyServer {
 
         let dns_resolver = if config.enable_doh {
             Some(
-                DnsResolver::shared(
+                DnsResolver::shared_with_policy(
                     &config.doh_server,
                     config.doh_server_ech.as_deref(),
                     config.prefer_ipv6,
                     config.upstream_proxy.clone(),
+                    config.ech_dns_policy.clone(),
                 )
                 .await?,
             )

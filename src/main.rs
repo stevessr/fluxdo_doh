@@ -99,6 +99,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         prefer_ipv6,
         doh_server,
         doh_server_ech,
+        ech_dns_policy: args
+            .iter()
+            .position(|arg| arg == "--ech-dns-policy")
+            .and_then(|i| args.get(i + 1))
+            .map(|value| serde_json::from_str(value))
+            .transpose()?
+            .unwrap_or_default(),
         upstream_proxy,
         server_ip,
         h2_mitm,

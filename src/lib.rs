@@ -11,6 +11,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 pub mod cert;
 pub mod dns;
 pub mod ech;
+pub mod ech_dns_policy;
 pub mod error;
 pub mod ffi;
 pub mod proxy;
@@ -130,6 +131,9 @@ pub struct ProxyConfig {
     /// When None, uses the same server as doh_server
     #[serde(default)]
     pub doh_server_ech: Option<String>,
+    /// 公共 ECH 入口开关与自定义域名。
+    #[serde(default)]
+    pub ech_dns_policy: ech_dns_policy::EchDnsPolicy,
     /// Whether to prefer IPv6
     pub prefer_ipv6: bool,
     /// Connection timeout in seconds
@@ -169,6 +173,7 @@ impl Default for ProxyConfig {
             enable_doh: true,
             doh_server: "https://cloudflare-dns.com/dns-query".to_string(),
             doh_server_ech: None,
+            ech_dns_policy: Default::default(),
             prefer_ipv6: false,
             timeout_secs: 30,
             upstream_proxy: None,
