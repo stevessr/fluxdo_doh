@@ -6,6 +6,7 @@
 
 - **DOH DNS 解析**：通过 HTTPS 加密 DNS 查询，防止 DNS 污染
 - **ECH 支持**：加密 TLS 握手中的 SNI 字段（需要服务器支持）
+- **公共 ECH 入口（可关闭）**：默认对 `linux.do`、`ldstatic.com` 及其子域名生效，可添加自定义目标域名；匹配域名的 A、AAAA、HTTPS 查询统一使用 `cloudflare-ech.com`，由所选 DoH 获取入口地址和 ECH 配置；TLS 仍使用真实目标域名并校验证书。其他域名按原名解析，手动指定的服务端 IP 仍优先。
 - **多 DOH 服务器**：支持 Cloudflare、Canadian Shield、Google、Quad9、DNSPod、腾讯 DNS、阿里 DNS
 - **跨平台**：支持 Windows、macOS、Linux、Android、iOS
 
@@ -247,11 +248,38 @@ void doh_proxy_init_logging();
 
 ## 工作原理
 
+论坛公共入口策略同时用于 rhttp 的解析接口和本地 Rust 网关。国内 DoH 无需再查询论坛域名本身，但仍须能返回 `cloudflare-ech.com` 的有效地址和 HTTPS/ECH 记录，且网络能够连接对应入口。取得 ECH 配置不代表服务端已经接受 ECH；网关日志中的 `ECH status: Accepted` 才表示该连接协商成功。
+
 1. **HTTP CONNECT 代理**：客户端发送 `CONNECT host:port` 请求
 2. **DOH DNS 解析**：通过加密 HTTPS 查询 DNS，获取目标 IP
 3. **TCP 隧道**：建立到目标服务器的 TCP 连接
 4. **双向转发**：在客户端和服务器之间转发数据
 5. **ECH（可选）**：如果服务器支持，加密 TLS 握手中的 SNI
+
+## 配置公共 ECH 入口
+
+应用入口：网络设置 → DoH 更多设置 → ECH → 公共 ECH 入口 / 适用域名。默认开启；关闭后按真实域名查询 IP 和站点自身的 ECH，已保存的自定义域名仍保留。自定义域名仅适用于支持 Cloudflare ECH 的站点，包含所有子域名；不接受 URL、IP、端口、路径或通配符。
+
+域名管理在保存时一次应用。开关或规则变化会清除旧解析缓存，按新策略重建连接。策略随应用偏好持久化，rhttp 的 FFI 查询、Rust 网关和 Dart 后备解析使用同一份配置。
+
+Rust `ProxyConfig.ech_dns_policy` 和独立程序 `--ech-dns-policy` 接受 `{"enabled": true, "custom_domains": ["example.com"]}`。FFI 独立查询通过 `doh_proxy_set_ech_dns_policy_json` 更新策略，解析器按策略隔离缓存；已有 TLS 连接不会因 DNS 配置改变而改写目标域名。
+
+## 验证公共 ECH 入口
+
+单元测试使用本地模拟 DoH，验证查询替换、域名边界和原域名缓存：
+
+```bash
+cargo test --locked --features ech
+```
+
+公网冒烟测试默认忽略，显式运行时验证所选 DoH、真实 `linux.do` 证书、`EchStatus::Accepted` 及 Cloudflare 返回的 `sni=encrypted`：
+
+```bash
+FLUXDO_ECH_DOH_URL=https://dns.alidns.com/dns-query \
+  cargo test --locked --features ech --test cloudflare_ech -- --ignored --nocapture
+```
+
+可将地址换成 `https://doh.pub/dns-query` 或 `https://dns.pub/dns-query`。测试结果只代表运行时的网络和服务端状态。
 
 ## 依赖
 

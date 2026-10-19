@@ -1,5 +1,6 @@
 //! DNS resolver with DOH and HTTPS record support for ECH config retrieval
 
+use crate::ech_dns_policy::EchDnsPolicy;
 use crate::error::{DohProxyError, Result};
 use crate::UpstreamProxyConfig;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -39,12 +40,240 @@ const STICKY_IP_TTL_SECS: u64 = 600;
 /// ECH 负结果（确定无 ECH）缓存时长，取短值以便域名启用 ECH 后尽快生效
 const ECH_NEGATIVE_TTL_SECS: u64 = 60;
 
+#[cfg(test)]
+mod ech_query_tests {
+    use super::*;
+    use crate::ech_dns_policy::CLOUDFLARE_ECH_QUERY_NAME;
+    use hickory_resolver::proto::{
+        op::{Message, MessageType},
+        rr::{
+            rdata::{
+                svcb::{EchConfig, SvcParamKey, SvcParamValue, SVCB},
+                A, AAAA,
+            },
+            Name, RData, Record, RecordType,
+        },
+    };
+    use http_body_util::Full;
+    use hyper::{body::Incoming, service::service_fn, Request, Response};
+    use hyper_util::rt::TokioIo;
+    use std::convert::Infallible;
+
+    #[test]
+    fn only_forum_domains_use_public_ech_entry() {
+        for host in [
+            "linux.do",
+            "www.linux.do",
+            "a.b.linux.do",
+            "LINUX.DO.",
+            "ldstatic.com",
+            "cdn.ldstatic.com",
+            "CDN.LDSTATIC.COM.",
+        ] {
+            assert_eq!(
+                EchDnsPolicy::default().query_name(host),
+                CLOUDFLARE_ECH_QUERY_NAME,
+                "{host}"
+            );
+        }
+        for host in [
+            "",
+            "notlinux.do",
+            "linux.do.example.com",
+            "evil-ldstatic.com",
+            "challenges.cloudflare.com",
+            "cloudflare-ech.com",
+            "example.com.",
+            "127.0.0.1",
+            "::1",
+            "中文.example",
+        ] {
+            assert_eq!(EchDnsPolicy::default().query_name(host), host, "{host}");
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_resolvers_isolate_caches_between_policies() {
+        let enabled = EchDnsPolicy::default();
+        let disabled = EchDnsPolicy {
+            enabled: false,
+            ..Default::default()
+        };
+        let a = DnsResolver::shared_with_policy(
+            "https://127.0.0.1/dns-query",
+            None,
+            false,
+            None,
+            None,
+            enabled.clone(),
+        )
+        .await
+        .unwrap();
+        a.record_host_success("linux.do", "192.0.2.10".parse().unwrap());
+        let b = DnsResolver::shared_with_policy(
+            "https://127.0.0.1/dns-query",
+            None,
+            false,
+            None,
+            None,
+            disabled,
+        )
+        .await
+        .unwrap();
+        assert!(!Arc::ptr_eq(&a, &b));
+        assert!(b.preferred_host_ip_cache.read().is_empty());
+        let c = DnsResolver::shared_with_policy(
+            "https://127.0.0.1/dns-query",
+            None,
+            false,
+            None,
+            None,
+            enabled,
+        )
+        .await
+        .unwrap();
+        assert!(Arc::ptr_eq(&a, &c));
+    }
+
+    // 模拟 DoH 上游，验证实际发出的三个查询及缓存，不依赖公网 DNS。
+    #[tokio::test]
+    async fn forum_queries_share_public_entry_and_keep_original_host_cache() {
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let observed = queries.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint: Uri = format!("http://{}/dns-query", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let observed = observed.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |req: Request<Incoming>| {
+                        let observed = observed.clone();
+                        async move {
+                            let encoded = req.uri().query().unwrap().strip_prefix("dns=").unwrap();
+                            let query =
+                                Message::from_vec(&URL_SAFE_NO_PAD.decode(encoded).unwrap())
+                                    .unwrap();
+                            let question = query.queries()[0].clone();
+                            let name = question.name().to_ascii();
+                            let record_type = question.query_type();
+                            observed.lock().await.push((name.clone(), record_type));
+                            let is_public = name == "cloudflare-ech.com.";
+                            let data = match record_type {
+                                RecordType::A => RData::A(A(if is_public {
+                                    [192, 0, 2, 10]
+                                } else {
+                                    [192, 0, 2, 11]
+                                }
+                                .into())),
+                                RecordType::AAAA => {
+                                    RData::AAAA(AAAA("2001:db8::10".parse().unwrap()))
+                                }
+                                RecordType::HTTPS => RData::HTTPS(HTTPS(SVCB::new(
+                                    1,
+                                    Name::root(),
+                                    vec![(
+                                        SvcParamKey::EchConfig,
+                                        SvcParamValue::EchConfig(EchConfig(vec![0, 3, 1, 2, 3])),
+                                    )],
+                                ))),
+                                _ => unreachable!(),
+                            };
+                            let mut response = Message::new();
+                            response
+                                .set_id(query.id())
+                                .set_message_type(MessageType::Response)
+                                .add_query(question.clone())
+                                .add_answer(Record::from_rdata(question.name().clone(), 120, data));
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .header("content-type", "application/dns-message")
+                                    .body(Full::new(bytes::Bytes::from(response.to_vec().unwrap())))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        let mut resolver =
+            DnsResolver::with_resolver_config(ResolverConfig::cloudflare_https(), false)
+                .await
+                .unwrap();
+        let client = Client::builder().no_proxy().build().unwrap();
+        resolver.doh_uri_ip = Some(endpoint.clone());
+        resolver.doh_uri_ech = Some(endpoint);
+        resolver.doh_client_ip = Some(client.clone());
+        resolver.doh_client_ech = Some(client);
+        resolver.force_doh_get_ip = true;
+        resolver.force_doh_get_ech = true;
+
+        let result = resolver.lookup_host("linux.do", false).await.unwrap();
+        assert!(result.addrs.contains(&"192.0.2.10".parse().unwrap()));
+        assert_eq!(result.ech_config.unwrap().as_ref(), &[0, 3, 1, 2, 3]);
+        assert!(result.ttl <= Duration::from_secs(120));
+        assert!(result.ttl > Duration::from_secs(110));
+        assert!(result.preferred_ip.is_none());
+        let mut types = queries.lock().await.clone();
+        assert_eq!(types.len(), 3);
+        assert!(types.iter().all(|(name, _)| name == "cloudflare-ech.com."));
+        types.sort_by_key(|(_, kind)| u16::from(*kind));
+        assert_eq!(
+            types.iter().map(|(_, kind)| *kind).collect::<Vec<_>>(),
+            vec![RecordType::A, RecordType::AAAA, RecordType::HTTPS]
+        );
+        assert!(resolver.ip_cache.read().contains_key("linux.do"));
+        assert!(resolver.ech_cache.read().contains_key("linux.do"));
+
+        resolver.record_host_success("linux.do", "192.0.2.10".parse().unwrap());
+        assert!(resolver
+            .lookup_host("linux.do", false)
+            .await
+            .unwrap()
+            .preferred_ip
+            .is_some());
+        assert_eq!(queries.lock().await.len(), 3);
+        resolver.lookup_host("linux.do", true).await.unwrap();
+        assert_eq!(queries.lock().await.len(), 6);
+
+        let unrelated = resolver.lookup_host("example.com", false).await.unwrap();
+        assert!(unrelated.addrs.contains(&"192.0.2.11".parse().unwrap()));
+        assert!(queries.lock().await[6..]
+            .iter()
+            .all(|(name, _)| name == "example.com."));
+        resolver.ech_dns_policy = EchDnsPolicy {
+            enabled: true,
+            custom_domains: vec!["custom.example".into()],
+        };
+        resolver
+            .lookup_host("cdn.custom.example", true)
+            .await
+            .unwrap();
+        assert!(queries.lock().await[9..12]
+            .iter()
+            .all(|(name, _)| name == "cloudflare-ech.com."));
+        resolver.ech_dns_policy.enabled = false;
+        let normal = resolver.lookup_host("linux.do", true).await.unwrap();
+        assert!(normal.addrs.contains(&"192.0.2.11".parse().unwrap()));
+        assert!(queries.lock().await[12..15]
+            .iter()
+            .all(|(name, _)| name == "linux.do."));
+        server.abort();
+    }
+}
+
 static SHARED_RESOLVERS: OnceLock<Arc<AsyncRwLock<HashMap<String, Arc<DnsResolver>>>>> =
     OnceLock::new();
 
 /// DNS resolver with ECH config caching
 pub struct DnsResolver {
     resolver: TokioAsyncResolver,
+    ech_dns_policy: EchDnsPolicy,
     // IP 解析用（A/AAAA 查询）
     doh_uri_ip: Option<Uri>,
     doh_client_ip: Option<Client>,
@@ -133,6 +362,8 @@ pub struct HttpsHints {
     pub ipv6_hints: Vec<IpAddr>,
 }
 
+static SHARED_ECH_DNS_POLICY: OnceLock<RwLock<EchDnsPolicy>> = OnceLock::new();
+
 impl DnsResolver {
     fn normalize_host(domain: &str) -> String {
         domain.trim().trim_end_matches('.').to_ascii_lowercase()
@@ -148,7 +379,6 @@ impl DnsResolver {
             if host.is_empty() {
                 continue;
             }
-
             let mut addresses = Vec::new();
             for value in values {
                 let Ok(address) = value.trim().parse::<IpAddr>() else {
@@ -161,7 +391,6 @@ impl DnsResolver {
             if addresses.is_empty() {
                 continue;
             }
-
             if prefer_ipv6 {
                 addresses.sort_by_key(|address| if address.is_ipv6() { 0 } else { 1 });
             } else {
@@ -172,12 +401,26 @@ impl DnsResolver {
         normalized
     }
 
+    /// 仅影响后续查询；已有连接持有自己的策略快照。
+    pub async fn set_shared_ech_dns_policy(policy: EchDnsPolicy) {
+        let policy = policy.normalized();
+        {
+            let mut current = SHARED_ECH_DNS_POLICY.get_or_init(Default::default).write();
+            if *current == policy {
+                return;
+            }
+            *current = policy;
+        }
+        Self::shared_resolver_holder().write().await.clear();
+    }
+
     fn shared_cache_key(
         doh_url: &str,
         doh_url_ech: Option<&str>,
         prefer_ipv6: bool,
         upstream_proxy: Option<&UpstreamProxyConfig>,
         host_overrides: Option<&HashMap<String, Vec<String>>>,
+        ech_dns_policy: &EchDnsPolicy,
     ) -> String {
         let upstream_key = upstream_proxy
             .map(UpstreamProxyConfig::cache_key)
@@ -194,12 +437,13 @@ impl DnsResolver {
             })
             .unwrap_or_default();
         format!(
-            "{}|{}|{}|{}|hosts={}",
+            "{}|{}|{}|{}|hosts={}|policy={}",
             doh_url,
             doh_url_ech.unwrap_or(""),
             if prefer_ipv6 { "v6" } else { "v4" },
             upstream_key,
             hosts_key,
+            serde_json::to_string(ech_dns_policy).unwrap(),
         )
     }
 
@@ -213,7 +457,19 @@ impl DnsResolver {
         prefer_ipv6: bool,
         upstream_proxy: Option<UpstreamProxyConfig>,
     ) -> Result<Arc<Self>> {
-        Self::shared_with_overrides(doh_url, doh_url_ech, prefer_ipv6, upstream_proxy, None).await
+        let policy = SHARED_ECH_DNS_POLICY
+            .get_or_init(Default::default)
+            .read()
+            .clone();
+        Self::shared_with_policy(
+            doh_url,
+            doh_url_ech,
+            prefer_ipv6,
+            upstream_proxy,
+            None,
+            policy,
+        )
+        .await
     }
 
     pub async fn shared_with_overrides(
@@ -223,6 +479,30 @@ impl DnsResolver {
         upstream_proxy: Option<UpstreamProxyConfig>,
         host_overrides: Option<HashMap<String, Vec<String>>>,
     ) -> Result<Arc<Self>> {
+        let policy = SHARED_ECH_DNS_POLICY
+            .get_or_init(Default::default)
+            .read()
+            .clone();
+        Self::shared_with_policy(
+            doh_url,
+            doh_url_ech,
+            prefer_ipv6,
+            upstream_proxy,
+            host_overrides,
+            policy,
+        )
+        .await
+    }
+
+    pub async fn shared_with_policy(
+        doh_url: &str,
+        doh_url_ech: Option<&str>,
+        prefer_ipv6: bool,
+        upstream_proxy: Option<UpstreamProxyConfig>,
+        host_overrides: Option<HashMap<String, Vec<String>>>,
+        ech_dns_policy: EchDnsPolicy,
+    ) -> Result<Arc<Self>> {
+        let ech_dns_policy = ech_dns_policy.normalized();
         let normalized_doh_url_ech = doh_url_ech.filter(|value| *value != doh_url);
         let cache_key = Self::shared_cache_key(
             doh_url,
@@ -230,6 +510,7 @@ impl DnsResolver {
             prefer_ipv6,
             upstream_proxy.as_ref(),
             host_overrides.as_ref(),
+            &ech_dns_policy,
         );
 
         {
@@ -239,16 +520,16 @@ impl DnsResolver {
             }
         }
 
-        let resolver = Arc::new(
-            Self::new_with_overrides(
-                doh_url,
-                normalized_doh_url_ech,
-                prefer_ipv6,
-                upstream_proxy.clone(),
-                host_overrides.clone(),
-            )
-            .await?,
-        );
+        let mut resolver = Self::new_with_overrides(
+            doh_url,
+            normalized_doh_url_ech,
+            prefer_ipv6,
+            upstream_proxy.clone(),
+            host_overrides.clone(),
+        )
+        .await?;
+        resolver.ech_dns_policy = ech_dns_policy;
+        let resolver = Arc::new(resolver);
 
         let mut guard = Self::shared_resolver_holder().write().await;
         Ok(guard
@@ -548,6 +829,7 @@ impl DnsResolver {
 
         Ok(Self {
             resolver,
+            ech_dns_policy: EchDnsPolicy::default(),
             doh_uri_ip: None,
             doh_client_ip: None,
             force_doh_get_ip: false,
@@ -593,7 +875,11 @@ impl DnsResolver {
             return Ok(None);
         }
 
-        info!("Looking up HTTPS record for ECH config: {}", domain);
+        let query_name = self.ech_dns_policy.query_name(domain);
+        info!(
+            "Looking up HTTPS record for ECH config: {} (query: {})",
+            domain, query_name
+        );
 
         let (notify, is_leader) = {
             let mut inflight = self.ech_inflight.lock().await;
@@ -631,7 +917,7 @@ impl DnsResolver {
         let lookup = match tokio::time::timeout(
             self.resolve_timeout,
             self.resolver
-                .lookup(domain, hickory_resolver::proto::rr::RecordType::HTTPS),
+                .lookup(query_name, hickory_resolver::proto::rr::RecordType::HTTPS),
         )
         .await
         {
@@ -780,7 +1066,8 @@ impl DnsResolver {
             }
         }
 
-        debug!("Looking up IP for {}", domain);
+        let query_name = self.ech_dns_policy.query_name(domain);
+        debug!("Looking up IP for {} (query: {})", domain, query_name);
 
         let (notify, is_leader) = {
             let mut inflight = self.ip_inflight.lock().await;
@@ -815,7 +1102,8 @@ impl DnsResolver {
 
         let start = std::time::Instant::now();
         let lookup =
-            match tokio::time::timeout(self.resolve_timeout, self.resolver.lookup_ip(domain)).await
+            match tokio::time::timeout(self.resolve_timeout, self.resolver.lookup_ip(query_name))
+                .await
             {
                 Ok(result) => match result {
                     Ok(lookup) => lookup,
@@ -1473,10 +1761,12 @@ impl DnsResolver {
         use hickory_resolver::proto::rr::Name;
         use std::str::FromStr;
 
-        let fqdn = if domain.ends_with('.') {
-            domain.to_string()
+        // 仅替换 DNS 查询名；缓存、TLS SNI 和证书校验仍使用真实目标域名。
+        let query_name = self.ech_dns_policy.query_name(domain);
+        let fqdn = if query_name.ends_with('.') {
+            query_name.to_string()
         } else {
-            format!("{}.", domain)
+            format!("{}.", query_name)
         };
         let name = Name::from_str(&fqdn)
             .map_err(|e| DohProxyError::Dns(format!("Invalid domain {}: {}", domain, e)))?;
@@ -1535,9 +1825,10 @@ impl DnsResolver {
             .map_err(|e| DohProxyError::Dns(format!("Invalid DNS response: {}", e)))?;
 
         debug!(
-            "DoH GET {} {} completed in {} ms",
+            "DoH GET {} {} (query: {}) completed in {} ms",
             domain,
             record_type,
+            query_name,
             start.elapsed().as_millis()
         );
         Ok(Some(message))
