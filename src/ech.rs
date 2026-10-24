@@ -734,11 +734,14 @@ impl DohTlsConnector {
                 .map_err(|e| DohProxyError::Io(e))?;
 
         let (_, conn) = tls_stream.get_ref();
+        // Log the negotiated group, not merely the local provider's capabilities.
+        // Classical fallback must remain visible in diagnostics.
         debug!(
-            "TLS connection established for {}:{}, protocol: {:?}",
+            "TLS connection established for {}:{}, protocol: {:?}, key_exchange: {:?}",
             host,
             port,
-            conn.protocol_version()
+            conn.protocol_version(),
+            conn.negotiated_key_exchange_group().map(|group| group.name())
         );
 
         Ok(tls_stream)

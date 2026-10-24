@@ -25,6 +25,12 @@ jobs:
       - name: Generate CA certificates
         run: cargo run --bin gen_ca
 
+      - name: Verify hybrid PQ TLS provider
+        run: cargo test --locked --lib tls_crypto::tests
+
+      - name: Verify negotiated hybrid and classical TLS handshakes
+        run: cargo test --locked --features ech --test pq_handshake
+
       - name: Build
         run: cargo build --release --features ech
 
@@ -51,6 +57,17 @@ jobs:
       - name: Generate CA certificates
         run: cargo run --bin gen_ca
 
+      - name: Verify hybrid PQ TLS provider
+        run: cargo test --locked --lib tls_crypto::tests
+
+      - name: Verify negotiated hybrid and classical TLS handshakes
+        run: cargo test --locked --features ech --test pq_handshake
+
+      - name: Verify ECH and classical fallback builds
+        run: |
+          cargo test --locked --features ech --lib tls_crypto::tests
+          cargo test --locked --no-default-features --lib tls_crypto::tests
+
       - name: Build
         run: cargo build --release --features ech
 
@@ -76,6 +93,12 @@ jobs:
 
       - name: Generate CA certificates
         run: cargo run --bin gen_ca
+
+      - name: Verify hybrid PQ TLS provider
+        run: cargo test --locked --lib tls_crypto::tests
+
+      - name: Verify negotiated hybrid and classical TLS handshakes
+        run: cargo test --locked --features ech --test pq_handshake
 
       - name: Build
         run: cargo build --release --features ech
@@ -117,6 +140,12 @@ jobs:
 
       - name: Generate CA certificates
         run: cargo run --bin gen_ca
+
+      - name: Verify hybrid PQ TLS provider
+        run: cargo test --locked --lib tls_crypto::tests
+
+      - name: Verify negotiated hybrid and classical TLS handshakes
+        run: cargo test --locked --features ech --test pq_handshake
 
       - name: Build for Android
         env:
