@@ -26,8 +26,8 @@ pqc = ["rustls/aws_lc_rs", "rustls/prefer-post-quantum"]
 ech = ["pqc", "dep:aws-lc-rs"]
 
 [dependencies]
-# TLS with ECH support
-# Use ring by default (works everywhere), aws-lc-rs for ECH support
+# TLS: AWS-LC with post-quantum key exchange by default; ring is an
+# explicit --no-default-features compatibility fallback without ECH.
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 tokio-rustls = "0.26"
 webpki-roots = "0.26"
