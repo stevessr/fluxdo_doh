@@ -1,31 +1,25 @@
 use rustls::crypto::CryptoProvider;
 use rustls::CipherSuite;
 
-#[cfg(feature = "ech")]
-use rustls::crypto::SupportedKxGroup;
-#[cfg(feature = "ech")]
-use rustls::NamedGroup;
-
 /// 构建 TLS 加密提供者，cipher suite 顺序对齐 Chrome/BoringSSL：
 /// TLS 1.3: AES_128_GCM → AES_256_GCM → CHACHA20_POLY1305
 /// TLS 1.2: ECDHE_*_AES_128_GCM → ECDHE_*_AES_256_GCM → ECDHE_*_CHACHA20
 ///
-/// Key exchange groups 顺序：X25519 → secp256r1 → secp384r1（与 Chrome 一致）
+/// Key exchange groups 优先 X25519MLKEM768，保留 X25519 等传统组回退。
+/// ECH 和非 ECH 路径使用同一套后量子提供者，避免 ECH 模式意外禁用 PQC。
 pub fn build_provider() -> CryptoProvider {
-    #[cfg(feature = "ech")]
+    #[cfg(feature = "pqc")]
     {
         let mut provider = rustls::crypto::aws_lc_rs::default_provider();
-        // 过滤 MLKEM groups（Chrome 当前不使用）
-        provider.kx_groups = filter_kx_groups_chrome_style(provider.kx_groups);
-        // cipher suite 顺序对齐 Chrome
+        // prefer-post-quantum 使 ClientHello 初始 key share 优先发送
+        // X25519MLKEM768，而不是依赖服务器发起 HelloRetryRequest。
         provider.cipher_suites = reorder_cipher_suites_chrome_style(provider.cipher_suites);
         return provider;
     }
 
-    #[cfg(not(feature = "ech"))]
+    #[cfg(not(feature = "pqc"))]
     {
         let mut provider = rustls::crypto::ring::default_provider();
-        // ring 默认 ChaCha20 优先，重排为 Chrome 风格 AES 优先
         provider.cipher_suites = reorder_cipher_suites_chrome_style(provider.cipher_suites);
         return provider;
     }
@@ -65,19 +59,40 @@ fn reorder_cipher_suites_chrome_style(
     sorted
 }
 
-/// 过滤 key exchange groups，移除 Chrome 当前不使用的 MLKEM 相关 groups，
-/// 保持 X25519 → secp256r1 → secp384r1 顺序（与 Chrome 一致）。
-#[cfg(feature = "ech")]
-fn filter_kx_groups_chrome_style(
-    groups: Vec<&'static dyn SupportedKxGroup>,
-) -> Vec<&'static dyn SupportedKxGroup> {
-    groups
-        .into_iter()
-        .filter(|group| {
-            !matches!(
-                group.name(),
-                NamedGroup::X25519MLKEM768 | NamedGroup::secp256r1MLKEM768 | NamedGroup::MLKEM768
-            )
-        })
-        .collect()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(feature = "pqc")]
+    fn hybrid_pq_group_is_preferred_with_classical_fallback() {
+        use rustls::NamedGroup;
+        let provider = build_provider();
+        let groups: Vec<_> = provider.kx_groups.iter().map(|g| g.name()).collect();
+        assert_eq!(groups.first(), Some(&NamedGroup::X25519MLKEM768));
+        assert!(groups.contains(&NamedGroup::X25519));
+        assert!(groups.contains(&NamedGroup::secp256r1));
+    }
+
+    #[test]
+    #[cfg(feature = "pqc")]
+    fn pq_provider_builds_tls13_client_config() {
+        use std::sync::Arc;
+        let provider = Arc::new(build_provider());
+        assert!(
+            rustls::ClientConfig::builder_with_provider(provider)
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "pqc"))]
+    fn legacy_provider_preserves_classical_tls() {
+        let provider = build_provider();
+        assert!(provider
+            .kx_groups
+            .iter()
+            .any(|group| group.name() == rustls::NamedGroup::X25519));
+    }
 }
