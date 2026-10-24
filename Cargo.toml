@@ -18,9 +18,12 @@ name = "gen_ca"
 path = "src/bin/gen_ca.rs"
 
 [features]
-default = []
-# Enable ECH support (requires cmake, NASM on Windows)
-ech = ["rustls/aws_lc_rs", "dep:aws-lc-rs"]
+# Hybrid post-quantum TLS is enabled in normal builds. Use --no-default-features
+# only when AWS-LC cannot be built on the target toolchain.
+default = ["pqc"]
+pqc = ["rustls/aws_lc_rs", "rustls/prefer-post-quantum"]
+# ECH uses AWS-LC HPKE and must keep the same PQ-capable TLS provider.
+ech = ["pqc", "dep:aws-lc-rs"]
 
 [dependencies]
 # TLS with ECH support
