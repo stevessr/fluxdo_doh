@@ -9,6 +9,7 @@
 - **公共 ECH 入口（可关闭）**：默认对 `linux.do`、`ldstatic.com` 及其子域名生效，可添加自定义目标域名；匹配域名的 A、AAAA、HTTPS 查询统一使用 `cloudflare-ech.com`，由所选 DoH 获取入口地址和 ECH 配置；TLS 仍使用真实目标域名并校验证书。其他域名按原名解析，手动指定的服务端 IP 仍优先。
 - **多 DOH 服务器**：支持 Cloudflare、Canadian Shield、Google、Quad9、DNSPod、腾讯 DNS、阿里 DNS
 - **跨平台**：支持 Windows、macOS、Linux、Android、iOS
+- **后量子 TLS 1.3**：默认通过 AWS-LC/rustls 优先协商 Cloudflare 推荐的 `X25519MLKEM768`（TLS group 0x11ec），保留传统 X25519 回退；ECH 和普通 TLS 连接共用同一提供者
 
 ## 项目结构
 
@@ -290,3 +291,14 @@ FLUXDO_ECH_DOH_URL=https://dns.alidns.com/dns-query \
 ## License
 
 MIT
+
+## Cloudflare 后量子 TLS
+
+- 默认构建启用 `pqc`，使用 `rustls/aws_lc_rs` 和 `rustls/prefer-post-quantum`。ECH 构建通过 `ech` 隐式启用 `pqc`，不再过滤 ML-KEM groups。
+- 与 Cloudflare 的 TLS 1.3 连接优先提供 `X25519MLKEM768`。如果远端不支持该组，rustls 仍可以协商 X25519 等传统密钥交换组（连接建立不等于 PQC 已生效）。
+- `RUST_LOG=debug` 下的 `key_exchange: Some(X25519MLKEM768)` 表示该条 TLS 连接已使用混合密钥交换；`Some(X25519)` 表示传统密钥交换；复用连接或握手恢复的日志应按实际情况解释。
+- `cargo test --locked --lib tls_crypto::tests` 验证协商组列表及 TLS 1.3 配置；`cargo test --locked --no-default-features --lib tls_crypto::tests` 验证回退构建；`cargo test --locked --features ech --lib tls_crypto::tests` 验证 ECH+PQC 共存。
+- AWS-LC 在部分平台需 CMake、C/C++ 编译器及 Windows 上的 NASM；如本机无法构建 AWS-LC，可显式使用 `--no-default-features` 获得传统 TLS，但该构建不具备后量子密钥交换能力。
+- 本升级保护的是本代理主动建立的 TLS 连接。CONNECT 纯隧道、Flutter 内置网络栈、Android Cronet、Apple URLSession 和外部 `rhttp` 引擎由它们各自的 TLS 实现决定，不能据此宣称全应用所有连接均使用 PQC。MITM 模式到上游的 TLS 与本地客户端到代理的 TLS 是两条独立连接。
+
+Cloudflare 参考文档：https://developers.cloudflare.com/ssl/post-quantum-cryptography/
